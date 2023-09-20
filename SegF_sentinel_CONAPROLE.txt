@@ -1,0 +1,467 @@
+////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
+// App para estimacion de PPNA de recusos forrajeros con Sentinel 2
+// Desarollada por Pedro Pellegrini (pellegrini@agro.uba.ar) y el
+// Laboratorio de Analisis Regional y Teledeteccion (LART) de la
+// Universidad de Buenos Aires.
+////////////////////////////////////////////////////////////
+////////////////////////////////////////////////////////////
+
+var table_CN = table4 //colocar el nombre del .shp de campo natural como aparece en Imports
+var table_P = table2 //colocar el nombre del .shp de pastura como aparece en Imports
+
+////////////////////////////////////////////////////////////
+// 1. Vectores y fecha de interes
+////////////////////////////////////////////////////////////
+
+// Agrega vector 
+var potreros = table3;
+// Defino fechas de interes
+var fechafin= ee.Date(Date.now());
+
+var fechaini = fechafin.advance(-365,'day') // acá se define que el gráfico se haga un año hacia atrás (-365)
+//print (fechaini);
+//print (fechafin);
+
+
+////////////////////////////////////////////////////////////
+// 2. Sentinel 2 - NDVI
+////////////////////////////////////////////////////////////
+
+// Carga Sentinel 2, filtra por fecha y area, y remueve imagenes con mas de 10% de nubes
+var NDVI = ee.ImageCollection('COPERNICUS/S2_SR')
+.filterDate(fechaini, fechafin)
+.filterBounds(potreros)
+.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE',10))
+//.select('B8','B4');
+
+////////////////////////////////////////////////////////////
+// 3. CALCULO FRFAi con Sentinel NDVI
+////////////////////////////////////////////////////////////
+
+// En esta sección se toma el NDVI de Sentinel y se crean distintas bandas
+// necesarias para obtener, finalmente, las bandas de Tasa de los diferentes recursos
+
+var addDate = function(image){
+  var doy = image.date().getRelative('day', 'year')
+var doyBand = ee.Image.constant(doy).uint16().rename('doy')
+  return image.addBands(doyBand)
+}
+var NDVIn = NDVI.map(addDate)
+//print('n',NDVIn)
+
+var addPAR = function(image){
+var f = image.expression('  1.310e+01 -9.188e-09*(x**4) +6.468e-06*(x**3) -1.136e-03*(x**2) -7.861e-04*x', { 
+  //formula empirica de radiacion PAR incidente en Uruguay
+      'x': image.select('doy')
+  }).rename('PAR')
+  return image.addBands(f)
+}
+var NDVIo = NDVIn.map(addPAR)
+//print('o',NDVIo)
+
+var addNDVI = function(image) {
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+};
+var NDVIoo = NDVIo.map(addNDVI)
+//print('oo',NDVIoo)
+
+var addfPAR = function(image){
+//var f = image.expression('min(max((1+NDVI)/(1-NDVI)/9.916077458,0),0.95)', { 
+var f = image.expression('min(max( 0.076111 + (0.014* exp(4.56 * (NDVI))* 0.981897 ),0),0.95)', { //formula Pellegrini et al. (2020)
+      'NDVI': image.select('NDVI')
+  }).rename('fPAR')
+ 
+  return image.addBands(f)
+}
+var NDVIp = NDVIoo.map(addfPAR)
+//print('p',NDVIp)
+
+var addAPAR = function(image){
+var f = image.expression('PAR*fPAR', {
+      'fPAR': image.select('fPAR'),
+      'PAR': image.select('PAR')
+  }).rename('APAR')
+ 
+  return image.addBands(f)
+}
+var NDVIq = NDVIp.map(addAPAR)
+//print('q',NDVIq)
+
+var addTASApastura = function(image){
+var f = image.expression('(PAR*fPAR*0.63587+0.6648)*10', { // Modelo de tasa de Pastura (LART)
+      'fPAR': image.select('fPAR'),
+      'PAR': image.select('PAR')
+  }).rename('TasaPastura')
+ 
+  return image.addBands(f)
+}
+var NDVIr = NDVIq.map(addTASApastura)
+//print('r',NDVIr)
+
+var addTASACN = function(image){
+var f = image.expression('(PAR*fPAR*0.3233+0.5451)*10', { // Modelo de tasa de Campo Natural (LART)
+      'fPAR': image.select('fPAR'),
+      'PAR': image.select('PAR')
+  }).rename('TasaCN')
+ 
+  return image.addBands(f)
+}
+var NDVIcn = NDVIr.map(addTASACN)
+//print('cn',NDVIcn)
+
+var NDVIcnPAST = NDVIcn.map(function(image){return image.clip(table_P)}) ;
+var NDVIcnCN = NDVIcn.map(function(image){return image.clip(table_CN)}) ;
+
+
+////////////////////////////////////////////////////////////
+// 4. MAPA 
+////////////////////////////////////////////////////////////
+var palettes = require('users/gena/packages:palettes'); //paleta de colores utilizada
+var palette = palettes.colorbrewer.Spectral[9];
+
+Map.style().set('cursor', 'crosshair')
+
+// Add the panel to the ui.root.
+//ui.root.insert(0, panel) 
+
+// MAPA
+
+// Tomar la imagenen mas reciente para graficarla en la app
+var size = ee.Number(NDVIcn.size()).add(-4) //genera numero de ultima imagen
+var listOfImages = NDVIcn.toList(NDVIcn.size()); //genera lista de imagenes
+var img1 =  ee.Image(listOfImages.get(size)); //hace una imagen del ultimo objeto de la lista
+
+// Define los valores minimos y maximos de tasa (kg/ha/dia) de cada recurso
+// Notar que el de Pastura es superior al de Campo Natural
+var vis = {bands: 'TasaPastura', min: 0, max: 70, palette:palette};
+var vis2 = {bands: 'TasaCN', min: 0, max: 30, palette:palette};
+
+var clipeado = img1.clip(table3)
+
+//Agrega las bandas de Tasa de los recursos
+var CN = NDVIcn.select("TasaCN")
+var mosaic = CN.mosaic();
+var clipeadoCN = mosaic.clip(table_CN)
+Map.addLayer(clipeadoCN, vis2, 'Tasa Campo Natural - Sentinel 2',false); //el false es para que la imagen no se cargue automaticamente al incio
+
+var Pas = NDVIcn.select("TasaPastura")
+var mosaicPas = Pas.mosaic();
+var clipeadoPas = mosaicPas.clip(table_P)
+Map.addLayer(clipeadoPas, vis, 'Tasa Pastura - Sentinel 2',false); //el false es para que la imagen no se cargue automaticamente al incio
+
+// Centra la pantalla en los lotes
+Map.centerObject(potreros)
+
+// Agrega los vectores de los lotes
+var d = ee.Image().paint(table_CN, 0, 1) //para cargar solo los bordes del lote
+Map.addLayer(d, null, 'Lotes - CN');
+
+var d2 = ee.Image().paint(table_P, 0, 1) //para cargar solo los bordes del lote
+Map.addLayer(d2, null, 'Lotes - Pasturas');
+
+/// COLOR pallete
+
+// Leyenda Pastura
+
+// Creates a color bar thumbnail image for use in legend from the given color
+// palette.
+function makeColorBarParamsP(palette) {
+  return {
+    bbox: [0, 0, 70, 5], //de 0 a 70 como los limites de la tasa de Pastura
+    dimensions: '100x10',
+    format: 'png',
+    min: 0,
+    max: 70,
+    palette: palette,
+  };
+}
+
+// Crea la barra de color para la leyenda
+var colorBarP = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: makeColorBarParamsP(vis.palette),
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+});
+
+// Crea un panel con los numeros de la leyenda
+var legendLabelsP = ui.Panel({
+  widgets: [
+    ui.Label(vis.min, {margin: '4px 8px'}),
+    ui.Label(
+        (vis.max / 2),
+        {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(vis.max, {margin: '4px 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+
+var legendTitleP = ui.Label({
+  value: 'Tasa Pastura (kgMS/ha/d)',
+  style: {fontWeight: 'bold'}
+});
+
+// Agrega la leyenda al mapa
+var legendPanelP = ui.Panel([legendTitleP, colorBarP, legendLabelsP]);
+Map.add(legendPanelP);
+
+
+// legend Campo Natural
+
+// Creates a color bar thumbnail image for use in legend from the given color
+// palette.
+function makeColorBarParams(palette) {
+  return {
+    bbox: [0, 0, 30, 5], //de 0 a 30, como los limites de la tasa de CN
+    dimensions: '100x10',
+    format: 'png',
+    min: 0,
+    max: 30,
+    palette: palette,
+  };
+}
+
+// Crea la barra de color para la leyenda
+var colorBar2 = ui.Thumbnail({
+  image: ee.Image.pixelLonLat().select(0),
+  params: makeColorBarParams(vis.palette),
+  style: {stretch: 'horizontal', margin: '0px 8px', maxHeight: '24px'},
+});
+
+// Crea un panel con los numeros de la leyenda
+var legendLabels = ui.Panel({
+  widgets: [
+    ui.Label(vis2.min, {margin: '4px 8px'}),
+    ui.Label(
+        (vis2.max / 2),
+        {margin: '4px 8px', textAlign: 'center', stretch: 'horizontal'}),
+    ui.Label(vis2.max, {margin: '4px 8px'})
+  ],
+  layout: ui.Panel.Layout.flow('horizontal')
+});
+
+var legendTitle = ui.Label({
+  value: 'Tasa Campo Natural (kgMS/ha/d)',
+  style: {fontWeight: 'bold'}
+});
+
+// Agrega la leyenda al mapa
+var legendPanel = ui.Panel([legendTitle, colorBar2, legendLabels]);
+Map.add(legendPanel);
+
+
+
+////////////////////////////////////////////////////////////
+// 5. Herramientas de dibujo en el mapa
+////////////////////////////////////////////////////////////
+
+var drawingTools = Map.drawingTools();
+drawingTools.setShown(false);
+
+//The design of the app is to handle charting a time series for a single geometry, 
+//so remove any that exist.
+
+while (drawingTools.layers().length() > 0) {
+  var layer = drawingTools.layers().get(0);
+  drawingTools.layers().remove(layer);
+}
+
+var dummyGeometry =
+    ui.Map.GeometryLayer({geometries: null, name: 'geometry', color: '23cba7'});
+
+drawingTools.layers().add(dummyGeometry);
+
+//////Drawing buttons
+//1. Define the geometry clearing function.
+function clearGeometry() {
+  var layers = drawingTools.layers();
+  layers.get(0).geometries().remove(layers.get(0).geometries().get(0));
+}
+
+//2. Define functions that will be called
+
+function drawPolygon() {
+  clearGeometry();
+  drawingTools.setShape('polygon');
+  drawingTools.draw();
+}
+
+function drawPoint() {
+  clearGeometry();
+  drawingTools.setShape('point');
+  drawingTools.draw();a
+}
+
+
+var symbol = {
+  polygon: '🔺',
+  point: '📍',
+};
+
+
+// Aca se genera el texto para el panel inferior izquierdo
+var controlPanel = ui.Panel({
+  widgets: [
+    ui.Label('1. Haga zoom al lote de interes.'),
+    ui.Label('2. Seleccione en Layers la cobertura del lote.'),
+    ui.Label('3. Espere que se cargue la imagen.'),
+    ui.Label('4. Seleccione poligono o punto:'),
+    ui.Button({
+      label: symbol.polygon + ' Poligono',
+      onClick: drawPolygon,
+      style: {stretch: 'horizontal'}
+    }),
+    ui.Button({
+      label: symbol.point + ' Punto',
+      onClick: drawPoint,
+      style: {stretch: 'horizontal'}
+    }),
+    ui.Label('5. Dibuje el area de interes.'),
+    ui.Label('6. Espere que se cargue el grafico.'),
+    ui.Label('7. Repita 1-6 para un nuevo lote.',
+        {whiteSpace: 'pre'}),
+    ui.Label('Para descargar los datos de un grafico, haga click en el simbolo'),
+    ui.Label('de la parte superior derecha del mismo. Eso abrira una nueva  '),
+    ui.Label('ventana. En esa nueva ventana, haga click en Download CSV')
+  ],
+  style: {position: 'bottom-left'},
+  layout: null,
+});
+
+//3. Add the panel to the Map.
+
+Map.add(controlPanel);
+
+
+////////////////////////////////////////////////////////////
+// 6. Grafico de Serie de tiempo de PPNA
+////////////////////////////////////////////////////////////
+
+
+//1. Define a panel to hold the time series chart. 
+
+var chartPanel = ui.Panel({
+  style:
+      {height: '450px', width: '600px', position: 'bottom-right', shown: false}
+});
+
+
+//2. Add the panel to the Map.
+
+Map.add(chartPanel);
+
+
+//FUNCION
+
+function chartNdviTimeSeries() {
+  // Make the chart panel visible the first time a geometry is drawn.
+  if (!chartPanel.style().get('shown')) {
+    chartPanel.style().set('shown', true);
+  }
+
+  // Get the drawn geometry; it will define the reduction region.
+  var aoi = drawingTools.layers().get(0).getEeObject();
+
+  // Set the drawing mode back to null; turns drawing off.
+  drawingTools.setShape(null);
+
+  // Reduction scale is based on map scale to avoid memory/timeout errors.
+  var mapScale = Map.getScale();
+  var scale = 10//mapScale > 5000 ? mapScale * 2 : 5000;
+
+  // Chart NDVI time series for the selected area of interest.
+  var chart = ui.Chart.image
+                  .seriesByRegion({
+                    imageCollection: NDVIcnPAST, 
+                    regions: aoi,
+                    reducer: ee.Reducer.mean(),
+                    band: 'TasaPastura',
+                    scale: scale,
+                    xProperty: 'system:time_start'
+                  })
+                  .setOptions({
+                    titlePostion: 'none',
+                    interpolateNulls: true,
+                    legend: {position: 'none'},
+                    hAxis: {title: 'Date'},
+                    vAxis: {title: 'Tasa Pastura (kgMS/ha/d)'},
+                    series: {0: {color: '23cba7'}}
+                  });
+
+  // Replace the existing chart in the chart panel with the new chart.
+  chartPanel.widgets().reset([chart]);
+  
+  chartPanel.widgets().set(1, chart)
+
+}
+
+function chartNdviTimeSeriesModis() {
+  // Make the chart panel visible the first time a geometry is drawn.
+  if (!chartPanel.style().get('shown')) {
+    chartPanel.style().set('shown', true);
+  }
+
+  // Get the drawn geometry; it will define the reduction region.
+  var aoi = drawingTools.layers().get(0).getEeObject();
+
+  // Set the drawing mode back to null; turns drawing off.
+  drawingTools.setShape(null);
+
+  // Reduction scale is based on map scale to avoid memory/timeout errors.
+  var mapScale = Map.getScale();
+  var scale = 10//mapScale > 5000 ? mapScale * 2 : 5000;
+
+  // Chart NDVI time series for the selected area of interest.
+  var chartM = ui.Chart.image
+                  .seriesByRegion({
+                    imageCollection: NDVIcnCN,
+                    regions: aoi,
+                    reducer: ee.Reducer.mean(),
+                    band: 'TasaCN',
+                    scale: scale,
+                    xProperty: 'system:time_start'
+                  })
+                  .setOptions({
+                    titlePostion: 'none',
+                    interpolateNulls: true,
+                    legend: {position: 'none'},
+                    hAxis: {title: 'Date'},
+                    vAxis: {title: 'Tasa Campo Natural (kgMS/ha/d)'},
+                    series: {0: {color: '23cba7'}}
+                  });
+
+  // Replace the existing chart in the chart panel with the new chart.
+  //chartPanel.widgets().reset([chart]);
+  chartPanel.widgets().set(2, chartM)
+
+}
+
+
+drawingTools.onDraw(ui.util.debounce(chartNdviTimeSeries, 500));
+drawingTools.onEdit(ui.util.debounce(chartNdviTimeSeries, 500));
+
+drawingTools.onDraw(ui.util.debounce(chartNdviTimeSeriesModis, 500));
+drawingTools.onEdit(ui.util.debounce(chartNdviTimeSeriesModis, 500));
+
+
+// Define a function to generate a download URL of the image for the
+// viewport region. 
+function downloadImg() {
+  var viewBounds = ee.Geometry.Rectangle(Map.getBounds());
+  var downloadArgs = {
+    name: 'ee_image',
+    crs: 'EPSG:4326',
+    scale: 10,
+    region: viewBounds.toGeoJSONString()
+ };
+ var url = img1.getDownloadURL(downloadArgs);
+ urlLabel.setUrl(url);
+ urlLabel.style().set({shown: true});
+}
+
+// Agrega los botones a la app
+var downloadButton = ui.Button('Download', downloadImg);
+var urlLabel = ui.Label('Download', {shown: false});
+var panel = ui.Panel([downloadButton, urlLabel]);
+Map.add(panel);
